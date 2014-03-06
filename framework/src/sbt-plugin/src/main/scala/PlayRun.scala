@@ -298,6 +298,7 @@ trait PlayRun extends PlayInternalKeys {
         argsTask, state, playCommonClassloader, managedClasspath in DocsApplication,
         dependencyClasspath, dependencyClassLoader, reloaderClassLoader, javaOptions
       ) map { (args, state, commonLoader, docsAppClasspath, appDependencyClasspath, createClassLoader, createReloader, javaOptions) =>
+        println(s"[][]  $state ${state.remainingCommands}    ${state.attributes.keys}    ${state.attributes.get(Watched.ContinuousState)}")
         val extracted = SbtProject.extract(state)
 
         val (_, hooks) = extracted.runTask(runHooks, state)
@@ -308,10 +309,9 @@ trait PlayRun extends PlayInternalKeys {
 
         require(httpPort.isDefined || httpsPort.isDefined, "You have to specify https.port when http.port is disabled")
 
+
         // Set Java properties
-        (properties ++ systemProperties).foreach {
-          case (key, value) => System.setProperty(key, value)
-        }
+        (properties ++ systemProperties).foreach((System.setProperty _).tupled)
 
         val sbtLoader: ClassLoader = this.getClass.getClassLoader
 
@@ -322,13 +322,10 @@ trait PlayRun extends PlayInternalKeys {
         try {
           println()
 
-          println("[][] beforeStarted ")
           // Now we're about to start, let's call the hooks:
           hooks.run(_.beforeStarted())
 
-          println("[][] withPlayServer")
           withPlayServer(sbtDocHandler, applicationLoader, httpPort, httpsPort, reloader) { server =>
-            println("[][] withPlayServer:Done")
             // Notify hooks
             hooks.run(_.afterStarted(server.mainAddress))
 
@@ -336,28 +333,26 @@ trait PlayRun extends PlayInternalKeys {
             println(Colors.green("(Server started, use Ctrl+D to stop and go back to the console...)"))
             println()
 
-            maybeContinuous(state) match {
-              case Some((watched, watchState)) => {
-                // ~ run mode
-                interaction doWithoutEcho {
-                  executeContinuously(watched, state, Some(WatchState.empty)) // should this use watchState?
-                }
-
-                // Remove state two first commands added by sbt ~
-                println(s"[rc1][] ${state}\n\t${state.remainingCommands}")
-                state.copy(remainingCommands = state.remainingCommands.drop(2)).remove(Watched.ContinuousState)
-                println(s"[rc2][] ${state}\n\t${state.remainingCommands}")
-              }
-              case _ => {
-                // run mode
-                interaction.waitForCancel()
-                state
-              }
-            }
-            println("[][] withPlayServer:end")
+//            maybeContinuous(state) match {
+//              case Some((watched, watchState)) => {
+//                // ~ run mode
+//                interaction doWithoutEcho {
+//                  executeContinuously(watched, state, Some(WatchState.empty)) // should this use watchState?
+//                }
+//
+//                // Remove state two first commands added by sbt ~
+//                state.copy(remainingCommands = state.remainingCommands.drop(2)).remove(Watched.ContinuousState)
+//              }
+//              case _ => {
+//                // run mode
+//                interaction.waitForCancel()
+//                state
+//              }
+//            }
+            interaction.waitForCancel()
           }
+
           // Notify hooks that we've stopped
-          println("[][] afterStopped")
           hooks.run(_.afterStopped())
 
           println()
@@ -375,7 +370,7 @@ trait PlayRun extends PlayInternalKeys {
             case (key, _) => System.clearProperty(key)
           }
         }
-    }
+      }
   }
 
 
