@@ -12,7 +12,10 @@ import java.net.InetSocketAddress
  *  apply startup/cleanup actions around a play application.
  */
 trait PlayRunHook {
-  /** Called before the play application is started, but after all "before run" tasks have been completed. */
+  /**
+   * Called immediately before the play application is started, but
+   * after all "before run" tasks have been completed.
+   */
   def beforeStarted(): Unit = ()
   /**
    * Called after the play applciation has been started.
@@ -20,18 +23,20 @@ trait PlayRunHook {
    */
   def afterStarted(addr: InetSocketAddress): Unit = ()
   /**
-   * Called after the play process has been stopped.
+   * Called after the play process has been stopped cleanly.
    */
   def afterStopped(): Unit = ()
 
   /**
    * Called if there was any exception thrown during play run.
    * Useful to implement to clean up any open resources for this hook.
+   * Do not assume resources opened in beforeStarted have been opened
+   *  yet, or that afterStopped was ever called.
    */
   def onError(): Unit = ()
 }
 
-case class RunHookCompositeThrowable(val throwables: Set[Throwable]) extends Exception(
+case class RunHookCompositeThrowable(val throwables: List[Throwable]) extends Exception(
   "Multiple exceptions thrown during PlayRunHook run: " +
     throwables.map(t => t + "\n" + t.getStackTrace.take(10).++("...").mkString("\n")).mkString("\n\n")
 )
@@ -74,7 +79,7 @@ object PlayRunHook {
         if (failures.size == 1) {
           throw failures.values.head
         } else {
-          throw RunHookCompositeThrowable(failures.values.toSet)
+          throw RunHookCompositeThrowable(failures.values.toList)
         }
       }
     } catch {

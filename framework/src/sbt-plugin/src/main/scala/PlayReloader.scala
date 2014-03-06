@@ -13,9 +13,14 @@ import PlayExceptions._
 trait PlayReloader {
   this: PlayCommands with PlayPositionMapper =>
 
+  type PlayReloader = SBTLink with Object {
+    def currentApplicationClassLoader: Option[ClassLoader]
+    def clean(): Unit
+  }
+
   // ----- Reloader
 
-  def newReloader(state: State, playReload: TaskKey[sbt.inc.Analysis], createClassLoader: ClassLoaderCreator, classpathTask: TaskKey[Classpath], baseLoader: ClassLoader) = {
+  def newReloader(state: State, playReload: TaskKey[sbt.inc.Analysis], createClassLoader: ClassLoaderCreator, classpathTask: TaskKey[Classpath], baseLoader: ClassLoader): PlayReloader = {
 
     val extracted = SbtProject.extract(state)
 

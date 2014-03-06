@@ -12,6 +12,8 @@ import annotation.tailrec
 import scala.collection.JavaConverters._
 import java.net.URLClassLoader
 import java.util.jar.JarFile
+import play.core.server.ServerWithStop
+import scala.util.Try
 
 /**
  * Provides mechanisms for running a Play application in SBT
@@ -59,6 +61,137 @@ trait PlayRun extends PlayInternalKeys {
     else (javaProperties, (maybePort.map(parsePort)).orElse(Some(defaultHttpPort)), maybeHttpsPort)
   }
 
+  // Get the URLs for the resources in a classpath
+  private def urls(cp: Classpath): Array[URL] = cp.map(_.data.toURI.toURL).toArray
+
+  /**
+   * ClassLoader that delegates loading of shared sbt link classes to the
+   * sbtLoader. Also accesses the reloader resources to make these available
+   * to the applicationLoader, creating a full circle for resource loading.
+   */
+  def createDelegatingLoader(commonLoader: ClassLoader, sbtLoader: ClassLoader, reloader: => PlayReloader): ClassLoader = new ClassLoader(commonLoader) {
+
+    // Support method to merge the output of two calls to ClassLoader.getResources(String) into a single result
+    private def combineResources(resources1: java.util.Enumeration[URL], resources2: java.util.Enumeration[URL]) =
+      new java.util.Vector[java.net.URL]((resources1.asScala ++ resources2.asScala).toSeq.distinct.asJava).elements
+
+    private val sbtSharedClasses = Seq(
+      classOf[play.core.SBTLink].getName,
+      classOf[play.core.SBTDocHandler].getName,
+      classOf[play.core.server.ServerWithStop].getName,
+      classOf[play.api.UsefulException].getName,
+      classOf[play.api.PlayException].getName,
+      classOf[play.api.PlayException.InterestingLines].getName,
+      classOf[play.api.PlayException.RichDescription].getName,
+      classOf[play.api.PlayException.ExceptionSource].getName,
+      classOf[play.api.PlayException.ExceptionAttachment].getName)
+
+    override def loadClass(name: String, resolve: Boolean): Class[_] = {
+      if (sbtSharedClasses.contains(name)) {
+        sbtLoader.loadClass(name)
+      } else {
+        super.loadClass(name, resolve)
+      }
+    }
+
+    // -- Delegate resource loading. We have to hack here because the default implementation is already recursive.
+    private val findResource = classOf[ClassLoader].getDeclaredMethod("findResource", classOf[String])
+    findResource.setAccessible(true)
+
+    override def getResource(name: String): java.net.URL = {
+      val resource = reloader.currentApplicationClassLoader.map(findResource.invoke(_, name).asInstanceOf[java.net.URL]).orNull
+      if (resource == null) {
+        super.getResource(name)
+      } else {
+        resource
+      }
+    }
+
+    private val findResources = classOf[ClassLoader].getDeclaredMethod("findResources", classOf[String])
+    findResources.setAccessible(true)
+
+    override def getResources(name: String): java.util.Enumeration[java.net.URL] = {
+      val resources1 = reloader.currentApplicationClassLoader.map(findResources.invoke(_, name).asInstanceOf[java.util.Enumeration[java.net.URL]]).getOrElse(new java.util.Vector[java.net.URL]().elements)
+      val resources2 = super.getResources(name)
+      combineResources(resources1, resources2)
+    }
+
+    override def toString = {
+      "DelegatingClassLoader, using parent: " + (getParent)
+    }
+
+  }
+
+
+  private def withPlayServer(sbtDocHandler: SBTDocHandler, applicationLoader: ClassLoader, httpPort: Option[Int], httpsPort: Option[Int], reloader: SBTLink)(f: ServerWithStop => Unit) = {
+
+    val server = {
+      val mainClass = applicationLoader.loadClass("play.core.server.NettyServer")
+      if (httpPort.isDefined) {
+        val mainDev = mainClass.getMethod("mainDevHttpMode", classOf[SBTLink], classOf[SBTDocHandler], classOf[Int])
+        mainDev.invoke(null, reloader, sbtDocHandler, httpPort.get: java.lang.Integer).asInstanceOf[ServerWithStop]
+      } else {
+        val mainDev = mainClass.getMethod("mainDevOnlyHttpsMode", classOf[SBTLink], classOf[SBTDocHandler], classOf[Int])
+        mainDev.invoke(null, reloader, sbtDocHandler, httpsPort.get: java.lang.Integer).asInstanceOf[ServerWithStop]
+      }
+    }
+
+    try {
+      f(server)
+    } finally {
+      server.stop()
+    }
+  }
+
+  @tailrec private def executeContinuously(watched: Watched, s: State, ws: Option[WatchState] = None): Option[String] = {
+    val ContinuousState = AttributeKey[WatchState]("watch state", "Internal: tracks state for continuous execution.")
+
+    @inline def isEOF(c: Int): Boolean = c == 4
+    @tailrec def shouldTerminate: Boolean = (System.in.available > 0) && (isEOF(System.in.read()) || shouldTerminate)
+
+    val sourcesFinder = PathFinder { watched watchPaths s }
+    val watchState = ws.getOrElse(s get ContinuousState getOrElse WatchState.empty)
+
+    println(s"[1][] \n\t$watched\n\t$watchState\n\t$ws\n\t$s\n\t$ContinuousState\n\t${WatchState.empty}")
+
+    val (triggered, newWatchState, newState) =
+      try {
+        val (triggered, newWatchState) = SourceModificationWatch.watch(sourcesFinder, watched.pollInterval, watchState)(shouldTerminate)
+        (triggered, newWatchState, s)
+      } catch {
+        case e: Exception =>
+          val log = s.log
+          log.error("Error occurred obtaining files to watch.  Terminating continuous execution...")
+          (false, watchState, s.fail)
+      }
+
+    println(s"[2][]\n\t$triggered\n\t$newWatchState\n\t$newState")
+
+    if (triggered) {
+      //Then launch compile
+      Project.synchronized {
+        val start = System.currentTimeMillis
+        SbtProject.runTask(compile in Compile, newState).get._2.toEither.right.map { _ =>
+          val duration = System.currentTimeMillis - start
+          val formatted = duration match {
+            case ms if ms < 1000 => ms + "ms"
+            case s => (s / 1000) + "s"
+          }
+          println("[" + Colors.green("success") + "] Compiled in " + formatted)
+        }
+      }
+
+      // Avoid launching too much compilation
+      Thread.sleep(Watched.PollDelayMillis)
+
+      // Call back myself
+      executeContinuously(watched, newState, Some(newWatchState))
+    } else {
+      // Stop
+      Some("Okay, i'm done")
+    }
+  }
+
   val createURLClassLoader: ClassLoaderCreator = (name, urls, parent) => new java.net.URLClassLoader(urls, parent) {
     override def toString = name + "{" + getURLs.map(_.toString).mkString(", ") + "}"
   }
@@ -67,6 +200,72 @@ trait PlayRun extends PlayInternalKeys {
     require(parent ne null)
     override def getResources(name: String): java.util.Enumeration[java.net.URL] = getParent.getResources(name)
     override def toString = name + "{" + getURLs.map(_.toString).mkString(", ") + "}"
+  }
+
+  def createLoaders(commonLoader: ClassLoader, sbtLoader: ClassLoader, createClassLoader: ClassLoaderCreator, appDependencyClasspath: Classpath, state: State, createReloader: ClassLoaderCreator, reloaderClasspath: TaskKey[Classpath]): (ClassLoader, PlayReloader) = {
+    /*
+    * We need to do a bit of classloader magic to run the Play application.
+    *
+    * There are six classloaders:
+    *
+    * 1. sbtLoader, the classloader of sbt and the Play sbt plugin.
+    * 2. commonLoader, a classloader that persists across calls to run.
+    *    This classloader is stored inside the
+    *    PlayInternalKeys.playCommonClassloader task. This classloader will
+    *    load the classes for the H2 database if it finds them in the user's
+    *    classpath. This allows H2's in-memory database state to survive across
+    *    calls to run.
+    * 3. delegatingLoader, a special classloader that overrides class loading
+    *    to delegate shared classes for sbt link to the sbtLoader, and accesses
+    *    the reloader.currentApplicationClassLoader for resource loading to
+    *    make user resources available to dependency classes.
+    *    Has the commonLoader as its parent.
+    * 4. applicationLoader, contains the application dependencies. Has the
+    *    delegatingLoader as its parent. Classes from the commonLoader and
+    *    the delegatingLoader are checked for loading first.
+    * 5. docsLoader, the classloader for the special play-docs application
+    *    that is used to serve documentation when running in development mode.
+    *    Has the applicationLoader as its parent for Play dependencies and
+    *    delegation to the shared sbt doc link classes.
+    * 6. reloader.currentApplicationClassLoader, contains the user classes
+    *    and resources. Has applicationLoader as its parent, where the
+    *    application dependencies are found, and which will delegate through
+    *    to the sbtLoader via the delegatingLoader for the shared link.
+    *    Resources are actually loaded by the delegatingLoader, where they
+    *    are available to both the reloader and the applicationLoader.
+    *    This classloader is recreated on reload. See PlayReloader.
+    *
+    * Someone working on this code in the future might want to tidy things up
+    * by splitting some of the custom logic out of the URLClassLoaders and into
+    * their own simpler ClassLoader implementations. The curious cycle between
+    * applicationLoader and reloader.currentApplicationClassLoader could also
+    * use some attention.
+    */
+
+    lazy val delegatingLoader: ClassLoader = createDelegatingLoader(commonLoader, sbtLoader, reloader)
+
+    lazy val applicationLoader = createClassLoader("PlayDependencyClassLoader", urls(appDependencyClasspath), delegatingLoader)
+
+    lazy val reloader = newReloader(state, playReload, createReloader, reloaderClasspath, applicationLoader)
+
+    (applicationLoader, reloader)
+  }
+
+  def createDocsHander(docsAppClasspath: Classpath, applicationLoader: ClassLoader): (SBTDocHandler, JarFile) = {
+    // Get a handler for the documentation. The documentation content lives in play/docs/content
+    // within the play-docs JAR.
+    val docsJarFile = {
+      val f = docsAppClasspath.map(_.data).filter(_.getName.startsWith("play-docs")).head
+      new JarFile(f)
+    }
+    val sbtDocHandler = {
+      val docsLoader = new URLClassLoader(urls(docsAppClasspath), applicationLoader)
+      val docHandlerFactoryClass = docsLoader.loadClass("play.docs.SBTDocHandlerFactory")
+      val factoryMethod = docHandlerFactoryClass.getMethod("fromJar", classOf[JarFile], classOf[String])
+      factoryMethod.invoke(null, docsJarFile, "play/docs/content").asInstanceOf[SBTDocHandler]
+    }
+
+    (sbtDocHandler, docsJarFile)
   }
 
   val playRunSetting: SbtProject.Initialize[InputTask[Unit]] = playRunTask(playRunHooks, playDependencyClasspath, playDependencyClassLoader, playReloaderClasspath, playReloaderClassLoader)
@@ -79,14 +278,26 @@ trait PlayRun extends PlayInternalKeys {
     playRunTask(runHooks, javaOptions in Runtime, dependencyClasspath, dependencyClassLoader, reloaderClasspath, reloaderClassLoader)
   }
 
+  // If we have both Watched.Configuration and Watched.ContinuousState
+  // attributes and if Watched.ContinuousState.count is 1 then we assume
+  // we're in ~ run mode
+  def maybeContinuous(state: State) = {
+    state.get(Watched.Configuration).flatMap { watched =>
+      state.get(Watched.ContinuousState).flatMap {
+        case watchState if watchState.count == 1 => Some((watched, watchState))
+        case _ => None
+      }
+    }
+  }
+
   def playRunTask(
     runHooks: TaskKey[Seq[play.PlayRunHook]], javaOptions: TaskKey[Seq[String]],
     dependencyClasspath: TaskKey[Classpath], dependencyClassLoader: TaskKey[ClassLoaderCreator],
-    reloaderClasspath: TaskKey[Classpath], reloaderClassLoader: TaskKey[ClassLoaderCreator]): SbtProject.Initialize[InputTask[Unit]] = inputTask { (argsTask: TaskKey[Seq[String]]) =>
-    (
-      argsTask, state, playCommonClassloader, managedClasspath in DocsApplication,
-      dependencyClasspath, dependencyClassLoader, reloaderClassLoader, javaOptions
-    ) map { (args, state, commonLoader, docsAppClasspath, appDependencyClasspath, createClassLoader, createReloader, javaOptions) =>
+    reloaderClasspath: TaskKey[Classpath], reloaderClassLoader: TaskKey[ClassLoaderCreator]): Def.Initialize[InputTask[Unit]] = inputTask { (argsTask: TaskKey[Seq[String]]) =>
+      (
+        argsTask, state, playCommonClassloader, managedClasspath in DocsApplication,
+        dependencyClasspath, dependencyClassLoader, reloaderClassLoader, javaOptions
+      ) map { (args, state, commonLoader, docsAppClasspath, appDependencyClasspath, createClassLoader, createReloader, javaOptions) =>
         val extracted = SbtProject.extract(state)
 
         val (_, hooks) = extracted.runTask(runHooks, state)
@@ -102,246 +313,69 @@ trait PlayRun extends PlayInternalKeys {
           case (key, value) => System.setProperty(key, value)
         }
 
-        println()
+        val sbtLoader: ClassLoader = this.getClass.getClassLoader
 
-        /*
-       * We need to do a bit of classloader magic to run the Play application.
-       *
-       * There are six classloaders:
-       *
-       * 1. sbtLoader, the classloader of sbt and the Play sbt plugin.
-       * 2. commonLoader, a classloader that persists across calls to run.
-       *    This classloader is stored inside the
-       *    PlayInternalKeys.playCommonClassloader task. This classloader will
-       *    load the classes for the H2 database if it finds them in the user's
-       *    classpath. This allows H2's in-memory database state to survive across
-       *    calls to run.
-       * 3. delegatingLoader, a special classloader that overrides class loading
-       *    to delegate shared classes for sbt link to the sbtLoader, and accesses
-       *    the reloader.currentApplicationClassLoader for resource loading to
-       *    make user resources available to dependency classes.
-       *    Has the commonLoader as its parent.
-       * 4. applicationLoader, contains the application dependencies. Has the
-       *    delegatingLoader as its parent. Classes from the commonLoader and
-       *    the delegatingLoader are checked for loading first.
-       * 5. docsLoader, the classloader for the special play-docs application
-       *    that is used to serve documentation when running in development mode.
-       *    Has the applicationLoader as its parent for Play dependencies and
-       *    delegation to the shared sbt doc link classes.
-       * 6. reloader.currentApplicationClassLoader, contains the user classes
-       *    and resources. Has applicationLoader as its parent, where the
-       *    application dependencies are found, and which will delegate through
-       *    to the sbtLoader via the delegatingLoader for the shared link.
-       *    Resources are actually loaded by the delegatingLoader, where they
-       *    are available to both the reloader and the applicationLoader.
-       *    This classloader is recreated on reload. See PlayReloader.
-       *
-       * Someone working on this code in the future might want to tidy things up
-       * by splitting some of the custom logic out of the URLClassLoaders and into
-       * their own simpler ClassLoader implementations. The curious cycle between
-       * applicationLoader and reloader.currentApplicationClassLoader could also
-       * use some attention.
-       */
+        val (applicationLoader, reloader) = createLoaders(commonLoader, sbtLoader, createClassLoader, appDependencyClasspath, state, createReloader, reloaderClasspath)
 
-        // Get the URLs for the resources in a classpath
-        def urls(cp: Classpath): Array[URL] = cp.map(_.data.toURI.toURL).toArray
-        // Support method to merge the output of two calls to ClassLoader.getResources(String) into a single result
-        def combineResources(resources1: java.util.Enumeration[URL], resources2: java.util.Enumeration[URL]) =
-          new java.util.Vector[java.net.URL]((resources1.asScala ++ resources2.asScala).toSeq.distinct.asJava).elements
-
-        val sbtLoader = this.getClass.getClassLoader
-
-        /**
-         * ClassLoader that delegates loading of shared sbt link classes to the
-         * sbtLoader. Also accesses the reloader resources to make these available
-         * to the applicationLoader, creating a full circle for resource loading.
-         */
-        lazy val delegatingLoader: ClassLoader = new ClassLoader(commonLoader) {
-
-          private val sbtSharedClasses = Seq(
-            classOf[play.core.SBTLink].getName,
-            classOf[play.core.SBTDocHandler].getName,
-            classOf[play.core.server.ServerWithStop].getName,
-            classOf[play.api.UsefulException].getName,
-            classOf[play.api.PlayException].getName,
-            classOf[play.api.PlayException.InterestingLines].getName,
-            classOf[play.api.PlayException.RichDescription].getName,
-            classOf[play.api.PlayException.ExceptionSource].getName,
-            classOf[play.api.PlayException.ExceptionAttachment].getName)
-
-          override def loadClass(name: String, resolve: Boolean): Class[_] = {
-            if (sbtSharedClasses.contains(name)) {
-              sbtLoader.loadClass(name)
-            } else {
-              super.loadClass(name, resolve)
-            }
-          }
-
-          // -- Delegate resource loading. We have to hack here because the default implementation is already recursive.
-          private val findResource = classOf[ClassLoader].getDeclaredMethod("findResource", classOf[String])
-          findResource.setAccessible(true)
-
-          override def getResource(name: String): java.net.URL = {
-            val resource = reloader.currentApplicationClassLoader.map(findResource.invoke(_, name).asInstanceOf[java.net.URL]).orNull
-            if (resource == null) {
-              super.getResource(name)
-            } else {
-              resource
-            }
-          }
-
-          private val findResources = classOf[ClassLoader].getDeclaredMethod("findResources", classOf[String])
-          findResources.setAccessible(true)
-
-          override def getResources(name: String): java.util.Enumeration[java.net.URL] = {
-            val resources1 = reloader.currentApplicationClassLoader.map(findResources.invoke(_, name).asInstanceOf[java.util.Enumeration[java.net.URL]]).getOrElse(new java.util.Vector[java.net.URL]().elements)
-            val resources2 = super.getResources(name)
-            combineResources(resources1, resources2)
-          }
-
-          override def toString = {
-            "DelegatingClassLoader, using parent: " + (getParent)
-          }
-
-        }
-
-        lazy val applicationLoader = createClassLoader("PlayDependencyClassLoader", urls(appDependencyClasspath), delegatingLoader)
-
-        lazy val reloader = newReloader(state, playReload, createReloader, reloaderClasspath, applicationLoader)
+        val (sbtDocHandler, docsJarFile) = createDocsHander(docsAppClasspath, applicationLoader)
 
         try {
+          println()
+
+          println("[][] beforeStarted ")
           // Now we're about to start, let's call the hooks:
           hooks.run(_.beforeStarted())
 
-          // Get a handler for the documentation. The documentation content lives in play/docs/content
-          // within the play-docs JAR.
-          val docsLoader = new URLClassLoader(urls(docsAppClasspath), applicationLoader)
-          val docsJarFile = {
-            val f = docsAppClasspath.map(_.data).filter(_.getName.startsWith("play-docs")).head
-            new JarFile(f)
-          }
-          val sbtDocHandler = {
-            val docHandlerFactoryClass = docsLoader.loadClass("play.docs.SBTDocHandlerFactory")
-            val factoryMethod = docHandlerFactoryClass.getMethod("fromJar", classOf[JarFile], classOf[String])
-            factoryMethod.invoke(null, docsJarFile, "play/docs/content").asInstanceOf[SBTDocHandler]
-          }
+          println("[][] withPlayServer")
+          withPlayServer(sbtDocHandler, applicationLoader, httpPort, httpsPort, reloader) { server =>
+            println("[][] withPlayServer:Done")
+            // Notify hooks
+            hooks.run(_.afterStarted(server.mainAddress))
 
-          val server = {
-            val mainClass = applicationLoader.loadClass("play.core.server.NettyServer")
-            if (httpPort.isDefined) {
-              val mainDev = mainClass.getMethod("mainDevHttpMode", classOf[SBTLink], classOf[SBTDocHandler], classOf[Int])
-              mainDev.invoke(null, reloader, sbtDocHandler, httpPort.get: java.lang.Integer).asInstanceOf[play.core.server.ServerWithStop]
-            } else {
-              val mainDev = mainClass.getMethod("mainDevOnlyHttpsMode", classOf[SBTLink], classOf[SBTDocHandler], classOf[Int])
-              mainDev.invoke(null, reloader, sbtDocHandler, httpsPort.get: java.lang.Integer).asInstanceOf[play.core.server.ServerWithStop]
-            }
-          }
+            println()
+            println(Colors.green("(Server started, use Ctrl+D to stop and go back to the console...)"))
+            println()
 
-          // Notify hooks
-          hooks.run(_.afterStarted(server.mainAddress))
-
-          println()
-          println(Colors.green("(Server started, use Ctrl+D to stop and go back to the console...)"))
-          println()
-
-          val ContinuousState = AttributeKey[WatchState]("watch state", "Internal: tracks state for continuous execution.")
-          def isEOF(c: Int): Boolean = c == 4
-
-          @tailrec def executeContinuously(watched: Watched, s: State, reloader: SBTLink, ws: Option[WatchState] = None): Option[String] = {
-            @tailrec def shouldTerminate: Boolean = (System.in.available > 0) && (isEOF(System.in.read()) || shouldTerminate)
-
-            val sourcesFinder = PathFinder { watched watchPaths s }
-            val watchState = ws.getOrElse(s get ContinuousState getOrElse WatchState.empty)
-
-            val (triggered, newWatchState, newState) =
-              try {
-                val (triggered, newWatchState) = SourceModificationWatch.watch(sourcesFinder, watched.pollInterval, watchState)(shouldTerminate)
-                (triggered, newWatchState, s)
-              } catch {
-                case e: Exception =>
-                  val log = s.log
-                  log.error("Error occurred obtaining files to watch.  Terminating continuous execution...")
-                  (false, watchState, s.fail)
-              }
-
-            if (triggered) {
-              //Then launch compile
-              Project.synchronized {
-                val start = System.currentTimeMillis
-                SbtProject.runTask(compile in Compile, newState).get._2.toEither.right.map { _ =>
-                  val duration = System.currentTimeMillis - start
-                  val formatted = duration match {
-                    case ms if ms < 1000 => ms + "ms"
-                    case s => (s / 1000) + "s"
-                  }
-                  println("[" + Colors.green("success") + "] Compiled in " + formatted)
+            maybeContinuous(state) match {
+              case Some((watched, watchState)) => {
+                // ~ run mode
+                interaction doWithoutEcho {
+                  executeContinuously(watched, state, Some(WatchState.empty)) // should this use watchState?
                 }
+
+                // Remove state two first commands added by sbt ~
+                state.copy(remainingCommands = state.remainingCommands.drop(2)).remove(Watched.ContinuousState)
               }
-
-              // Avoid launching too much compilation
-              Thread.sleep(Watched.PollDelayMillis)
-
-              // Call back myself
-              executeContinuously(watched, newState, reloader, Some(newWatchState))
-            } else {
-              // Stop
-              Some("Okay, i'm done")
-            }
-          }
-
-          // If we have both Watched.Configuration and Watched.ContinuousState
-          // attributes and if Watched.ContinuousState.count is 1 then we assume
-          // we're in ~ run mode
-          val maybeContinuous = state.get(Watched.Configuration).map { w =>
-            state.get(Watched.ContinuousState).map { ws =>
-              (ws.count == 1, w, ws)
-            }.getOrElse((false, None, None))
-          }.getOrElse((false, None, None))
-
-          val newState = maybeContinuous match {
-            case (true, w: sbt.Watched, ws) => {
-              // ~ run mode
-              interaction doWithoutEcho {
-                executeContinuously(w, state, reloader, Some(WatchState.empty))
+              case _ => {
+                // run mode
+                interaction.waitForCancel()
+                state
               }
-
-              // Remove state two first commands added by sbt ~
-              state.copy(remainingCommands = state.remainingCommands.drop(2)).remove(Watched.ContinuousState)
             }
-            case _ => {
-              // run mode
-              interaction.waitForCancel()
-              state
-            }
+            println("[][] withPlayServer:end")
           }
-
-          server.stop()
-          docsJarFile.close()
-          reloader.clean()
-
-          // Notify hooks
+          // Notify hooks that we've stopped
+          println("[][] afterStopped")
           hooks.run(_.afterStopped())
-
-          // Remove Java properties
-          properties.foreach {
-            case (key, _) => System.clearProperty(key)
-          }
 
           println()
         } catch {
           case e: Throwable =>
             // Let hooks clean up
-            hooks.foreach { hook =>
-              try {
-                hook.onError()
-              } catch {
-                case e: Throwable => // Swallow any exceptions so that all `onError`s get called.
-              }
-            }
+            hooks.foreach(h => Try(h.onError()))
             throw e
+        } finally {
+          docsJarFile.close()
+          reloader.clean()
+
+          // Remove Java properties
+          properties.foreach {
+            case (key, _) => System.clearProperty(key)
+          }
         }
-      }
+    }
   }
+
 
   val playStartCommand = Command.args("start", "<port>") { (state: State, args: Seq[String]) =>
 
