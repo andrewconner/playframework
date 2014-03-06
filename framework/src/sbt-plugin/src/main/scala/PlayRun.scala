@@ -344,7 +344,9 @@ trait PlayRun extends PlayInternalKeys {
                 }
 
                 // Remove state two first commands added by sbt ~
+                println(s"[rc1][] ${state}\n\t${state.remainingCommands}")
                 state.copy(remainingCommands = state.remainingCommands.drop(2)).remove(Watched.ContinuousState)
+                println(s"[rc2][] ${state}\n\t${state.remainingCommands}")
               }
               case _ => {
                 // run mode
